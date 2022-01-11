@@ -647,7 +647,7 @@
                   (reset! last-active true)
                   (log-message "Activating spout " component-id ":" (keys task-datas))
                   (fast-list-iter [^ISpout spout spouts] (.activate spout)))
-
+                ;; 调用spout nexttuple
                 (if (and (not (.isFull transfer-queue))
                       (not throttle-on)
                       (not reached-max-spout-pending))
