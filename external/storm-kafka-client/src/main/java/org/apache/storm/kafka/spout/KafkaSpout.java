@@ -281,12 +281,15 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
     @Override
     public void nextTuple() {
         try {
+            //刷新分配策略
             if (refreshSubscriptionTimer.isExpiredResetOnTrue()) {
                 kafkaSpoutConfig.getSubscription().refreshAssignment();
             }
 
+            //超过offsetCommitPeriodMs
             if (commitTimer != null && commitTimer.isExpiredResetOnTrue()) {
                 if (isAtLeastOnceProcessing()) {
+                    //对于acked tuple提交消息offset
                     commitOffsetsForAckedTuples(kafkaConsumer.assignment());
                 } else if (kafkaSpoutConfig.getProcessingGuarantee() == ProcessingGuarantee.NO_GUARANTEE) {
                     Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = 
@@ -296,15 +299,20 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
                 }
             }
 
+            //获取可以拉取数据的partition
+            //未提交的offset小于maxUncommittedOffsets的partition
+            //重试的tuple个数小于maxUncommittedOffsets的partition
             PollablePartitionsInfo pollablePartitionsInfo = getPollablePartitionsInfo();
             if (pollablePartitionsInfo.shouldPoll()) {
                 try {
+                    //数据存入待emit队列中
                     setWaitingToEmit(pollKafkaBroker(pollablePartitionsInfo));
                 } catch (RetriableException e) {
                     LOG.error("Failed to poll from kafka.", e);
                 }
             }
 
+            //emit tuple
             emitIfWaitingNotEmitted();
         } catch (InterruptException e) {
             throwKafkaConsumerInterruptedException();
@@ -329,8 +337,13 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
             return new PollablePartitionsInfo(assignment, Collections.<TopicPartition, Long>emptyMap());
         }
 
+        //每个partition最早的可重试的offset
         Map<TopicPartition, Long> earliestRetriableOffsets = retryService.earliestRetriableOffsets();
+        //如果所有的partition未提交的offset的数量都大于maxUncommittedOffsets，为空
+        //未提交的offset小于maxUncommittedOffsets
+        //重试的tuple个数小于maxUncommittedOffsets
         Set<TopicPartition> pollablePartitions = new HashSet<>();
+        //获取配置的最大的未提交的offset
         final int maxUncommittedOffsets = kafkaSpoutConfig.getMaxUncommittedOffsets();
         for (TopicPartition tp : assignment) {
             OffsetManager offsetManager = offsetManagers.get(tp);
@@ -339,6 +352,7 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
                 //Allow poll if the partition is not at the maxUncommittedOffsets limit
                 pollablePartitions.add(tp);
             } else {
+                //获取emit的offset中的第maxUncommittedOffsets个offset
                 long offsetAtLimit = offsetManager.getNthUncommittedOffsetAfterCommittedOffset(maxUncommittedOffsets);
                 Long earliestRetriableOffset = earliestRetriableOffsets.get(tp);
                 if (earliestRetriableOffset != null && earliestRetriableOffset <= offsetAtLimit) {
@@ -369,8 +383,11 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
     }
 
     // ======== poll =========
+    //拉取kafka消息
     private ConsumerRecords<K, V> pollKafkaBroker(PollablePartitionsInfo pollablePartitionsInfo) {
+        //拉取重试的partition
         doSeekRetriableTopicPartitions(pollablePartitionsInfo.pollableEarliestRetriableOffsets);
+        //需要暂停拉取的partition,如果pollablePartitions中含有partition，暂停拉取。即该patition含有未提交的或者重试的tuple，暂停拉取
         Set<TopicPartition> pausedPartitions = new HashSet<>(kafkaConsumer.assignment());
         Iterator<TopicPartition> pausedIter = pausedPartitions.iterator();
         while (pausedIter.hasNext()) {
@@ -379,8 +396,11 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
             }
         }
         try {
+            //暂停拉取patition含有未提交的或者重试的tuple
             kafkaConsumer.pause(pausedPartitions);
+            //拉取剩余partition数据，超时时间默认200ms
             final ConsumerRecords<K, V> consumerRecords = kafkaConsumer.poll(kafkaSpoutConfig.getPollTimeoutMs());
+            //ack重试的tuple，有未提交的offset且有重试tuple的partition
             ackRetriableOffsetsIfCompactedAway(pollablePartitionsInfo.pollableEarliestRetriableOffsets, consumerRecords);
             final int numPolledRecords = consumerRecords.count();
             LOG.debug("Polled [{}] records from Kafka",
@@ -394,13 +414,16 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
             }
             return consumerRecords;
         } finally {
+            //恢复暂停的partition
             kafkaConsumer.resume(pausedPartitions);
         }
     }
 
+    //重新拉取重试的partition
     private void doSeekRetriableTopicPartitions(Map<TopicPartition, Long> pollableEarliestRetriableOffsets) {
         for (Entry<TopicPartition, Long> retriableTopicPartitionAndOffset : pollableEarliestRetriableOffsets.entrySet()) {
             //Seek directly to the earliest retriable message for each retriable topic partition
+            //从最早重试消息开始拉取消息
             kafkaConsumer.seek(retriableTopicPartitionAndOffset.getKey(), retriableTopicPartitionAndOffset.getValue());
         }
     }
@@ -409,11 +432,16 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
         ConsumerRecords<K, V> consumerRecords) {
         for (Entry<TopicPartition, Long> entry : earliestRetriableOffsets.entrySet()) {
             TopicPartition tp = entry.getKey();
+            //获取消费到的记录
             List<ConsumerRecord<K, V>> records = consumerRecords.records(tp);
             if (!records.isEmpty()) {
+                //消费的第一条记录
                 ConsumerRecord<K, V> record = records.get(0);
+                //
                 long seekOffset = entry.getValue();
+                //第一条记录的offset
                 long earliestReceivedOffset = record.offset();
+                //ack partition 从seekOffset到earliestReceivedOffset的message
                 if (seekOffset < earliestReceivedOffset) {
                     //Since we asked for tuples starting at seekOffset, some retriable records must have been compacted away.
                     //Ack up to the first offset received if the record is not already acked or currently in the topology
@@ -438,23 +466,28 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
         while (waitingToEmitIter.hasNext()) {
             List<ConsumerRecord<K, V>> waitingToEmitForTp = waitingToEmitIter.next();
             while (!waitingToEmitForTp.isEmpty()) {
+                //emit或者重试tuple，调用之后第一个tuple 会被emit或者retry
+                //返回false : 1.已经ack 2.已经emit并且等待ack 3.消息failed 4.tuple是null
+                //成功emit之后返回true
                 final boolean emittedTuple = emitOrRetryTuple(waitingToEmitForTp.remove(0));
                 if (emittedTuple) {
                     break outerLoop;
                 }
             }
+            //全部失败或者全部成功之后移除list
             waitingToEmitIter.remove();
         }
     }
 
     /**
      * Creates a tuple from the kafka record and emits it if it was never emitted or it is ready to be retried.
-     *
+     * 用kafka 消息创建tuple
      * @param record to be emitted
      * @return true if tuple was emitted. False if tuple has been acked or has been emitted and is pending ack or fail
      */
     private boolean emitOrRetryTuple(ConsumerRecord<K, V> record) {
         final TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+        //获取消息id
         final KafkaSpoutMessageId msgId = retryService.getMessageId(record);
 
         if (offsetManagers.containsKey(tp) && offsetManagers.get(tp).contains(msgId)) {   // has been acked
@@ -462,6 +495,7 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
         } else if (emitted.contains(msgId)) {   // has been emitted and it is pending ack or fail
             LOG.trace("Tuple for record [{}] has already been emitted. Skipping", record);
         } else {
+            //提交位移
             final OffsetAndMetadata committedOffset = kafkaConsumer.committed(tp);
             if (isAtLeastOnceProcessing()
                 && committedOffset != null 
@@ -603,11 +637,15 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
                 LOG.debug("Received direct ack for message [{}], associated with null tuple", msgId);
             }
         } else {
+            //如果没有重试，抛异常
             Validate.isTrue(!retryService.isScheduled(msgId), "The message id " + msgId + " is queued for retry while being acked."
                 + " This should never occur barring errors in the RetryService implementation or the spout code.");
+            //已经重试调度了，ack message
             offsetManagers.get(msgId.getTopicPartition()).addToAckMsgs(msgId);
+            //emit队列移除message
             emitted.remove(msgId);
         }
+        //ack message
         tupleListener.onAck(msgId);
     }
 
@@ -733,6 +771,7 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
             this.pollablePartitions = pollablePartitions;
             this.pollableEarliestRetriableOffsets = new HashMap<>();
             for (TopicPartition tp : earliestRetriableOffsets.keySet()) {
+                //pollablePartitions包含重试的partition时，添加到pollableEarliestRetriableOffsets
                 if (this.pollablePartitions.contains(tp)) {
                     this.pollableEarliestRetriableOffsets.put(tp, earliestRetriableOffsets.get(tp));
                 }
